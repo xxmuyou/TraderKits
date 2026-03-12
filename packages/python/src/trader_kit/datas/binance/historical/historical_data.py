@@ -4,7 +4,7 @@ import io
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
-from typing import Any, Callable, Iterable, Mapping, Literal, Tuple, List, Union
+from typing import Any, Callable, Iterable, Mapping, Literal, Tuple, List, Set
 from collections import defaultdict
 
 import zipfile
@@ -15,7 +15,7 @@ import numpy as np
 
 from .schemas import KlinesColumns
 from ....utils import logger, async_get
-from .constants import BaseUrls, FrequencyTypes, FuturesDataItems, MarginTypes, KLINE_INTERVALS
+from .constants import BaseUrls, FrequencyTypes, FuturesDataItems, SpotDataItems, MarginTypes, INTERVAL_TO_STR_DICT, FUTURE_UM_KLINE_INTERVALS, SPOT_KLINE_INTERVALS
 
 
 KLINE_COLUMNS = [
@@ -26,14 +26,13 @@ KLINE_COLUMNS = [
 
 class HistoricalDataFetcher:
     @staticmethod
-    async def fetch_future_klines(
+    async def fetch_future_um_klines(
         symbols: Iterable[str],
         start_dt: datetime,
         end_dt: datetime,
         interval: timedelta,
         frequency: Literal["daily", "monthly"] = "daily",
         *,
-        margin_type: Literal["um", "cm"] = "um",
         max_concurrency: int = 16,
         max_workers: int = 8,
         timeout: float = 10.0,
@@ -53,7 +52,6 @@ class HistoricalDataFetcher:
             end_dt: Inclusive end of the date range.
             interval: Kline interval as a timedelta, e.g. ``timedelta(minutes=1)``, ``timedelta(hours=1)``, ``timedelta(days=1)``.
             frequency: ``"daily"`` for per-day files or ``"monthly"`` for per-month files.
-            margin_type: ``"um"`` for USDT-margined or ``"cm"`` for coin-margined.
             max_concurrency: Maximum concurrent HTTP coroutines.
             max_workers: Maximum threads in the decompression pool.
             timeout: Per-request HTTP timeout in seconds.
@@ -61,17 +59,12 @@ class HistoricalDataFetcher:
         Returns:
             ``{symbol: DataFrame}`` with all requested periods concatenated.
         """
-        interval_str = convert_interval_to_str(interval)
+        interval_str = convert_interval_to_str(interval, FUTURE_UM_KLINE_INTERVALS)
         if FrequencyTypes.has_value(frequency):
             frequency_enum = FrequencyTypes(frequency)
         else:
             raise ValueError(f"Invalid frequency: {frequency}. Must be 'daily' or 'monthly'.")
-        
-        if MarginTypes.has_value(margin_type):
-            margin_type_enum = MarginTypes(margin_type)
-        else:
-            raise ValueError(f"Invalid margin type: {margin_type}. Must be 'um' or 'cm'.")
-        
+        margin_type_enum = MarginTypes.UM
         tasks = [
             (symbol, _build_future_kline_url(
                 BaseUrls.FUTURE, symbol, interval_str, date_str, FuturesDataItems.KLINES, margin_type_enum, frequency_enum
@@ -100,14 +93,44 @@ class HistoricalDataFetcher:
         return _filter_and_localize_timestamps(aggregated, start_dt, end_dt)
 
     @staticmethod
-    def fetch_spot_klines(
+    async def fetch_spot_klines(
         symbols: Iterable[str],
         start_dt: datetime,
         end_dt: datetime,
         interval: timedelta,
-        frequency: Literal["daily", "monthly"]="daily",
+        *,
+        max_concurrency: int = 16,
+        max_workers: int = 8,
+        timeout: float = 10.0,
     ) -> Mapping[str, pd.DataFrame]:
-        ...
+        interval_str = convert_interval_to_str(interval, SPOT_KLINE_INTERVALS)
+        frequency_enum = FrequencyTypes.DAILY
+        tasks = [
+            (symbol, _build_spot_kline_url(
+                BaseUrls.SPOTS, symbol, interval_str, date_str, SpotDataItems.KLINES, frequency_enum
+            ))
+            for symbol in symbols
+            for date_str in iter_dates(start_dt, end_dt, frequency_enum)
+        ]
+
+        # Step 2: Fetch all zip + checksum files concurrently
+        fetched_results = await fetch_urls_async(tasks, max_concurrency=max_concurrency, timeout=timeout)
+        logger.info("Fetched files successfully.")
+
+        # Step 3: Drain fetch queue, then process each item in a thread pool.
+        raw_tasks: list[tuple[str, bytes, str]] = []
+        while not fetched_results.empty():
+            raw_tasks.append(fetched_results.get_nowait())
+
+        processed_queue = run_in_thread_pool(
+            _process_kline_raw_data,
+            raw_tasks,
+            max_workers=max_workers,
+        )
+
+        # Step 4: Aggregate per-symbol DataFrames (each thread already built one).
+        aggregated = _aggregate_symbol_dataframes(processed_queue)
+        return _filter_and_localize_timestamps(aggregated, start_dt, end_dt)
         
     @staticmethod
     def fetch_future_metrics(
@@ -151,6 +174,26 @@ class HistoricalDataFetcher:
 # Module-level helpers — reusable across all HistoricalDataFetcher methods
 # ---------------------------------------------------------------------------
 
+# -------------spot-kline-specific helpers --------------------------------------------------
+def _build_spot_kline_url(
+    base_url: BaseUrls.SPOTS,
+    symbol: str,
+    interval: str,
+    datetime_str: str,
+    kline_item: SpotDataItems,
+    frequency: FrequencyTypes.DAILY,
+) -> str:
+    """Construct the Binance Vision zip URL for a single spot kline file."""
+    return (
+        f"{base_url.value}"
+        f"{frequency.value}/"
+        f"{kline_item.value}/"
+        f"{symbol}/"
+        f"{interval}/"
+        f"{symbol}-{interval}-{datetime_str}.zip"
+    )
+
+# Reference: https://data.binance.vision/?prefix=data/spot/daily/klines/BTCUSD/
 # -------------kline-specific helpers --------------------------------------------------
 
 def _aggregate_symbol_dataframes(result_queue: queue.Queue[Tuple[str, pd.DataFrame]]) -> dict[str, pd.DataFrame]:
@@ -251,27 +294,14 @@ def _build_future_kline_url(
     )
 
 
-def convert_interval_to_str(interval: timedelta) -> str:
+def convert_interval_to_str(interval: timedelta, interval_set: Set[str]) -> str:
     """Check if the given timedelta interval corresponds to a supported KLINE_INTERVAL."""
-    _TIMEDELTA_TO_INTERVAL: dict[timedelta, str] = {
-        timedelta(minutes=1):  "1m",
-        timedelta(minutes=3):  "3m",
-        timedelta(minutes=5):  "5m",
-        timedelta(minutes=15): "15m",
-        timedelta(minutes=30): "30m",
-        timedelta(hours=1):    "1h",
-        timedelta(hours=2):    "2h",
-        timedelta(hours=4):    "4h",
-        timedelta(hours=6):    "6h",
-        timedelta(hours=8):    "8h",
-        timedelta(hours=12):   "12h",
-        timedelta(days=1):     "1d",
-    }
-    if interval in _TIMEDELTA_TO_INTERVAL:
-        return _TIMEDELTA_TO_INTERVAL[interval]
+    interval_str = INTERVAL_TO_STR_DICT.get(interval)
+    if interval_str and interval_str in interval_set:
+        return interval_str
     else:
         raise ValueError(
-            f"Unsupported interval: {interval}. Supported intervals are: {list(_TIMEDELTA_TO_INTERVAL.keys())}"
+            f"Unsupported interval: {interval}. Supported intervals are: {interval_set}."
         )
 
 
@@ -482,20 +512,17 @@ def convert_datetime_to_string(dt: datetime) -> str:
 
 if __name__ == "__main__":
     # Example usage
-    symbol = "BTCUSDT"
+    symbols = ["BTCUSDT", "ETHUSDT"]
     interval = timedelta(minutes=15)
-    start_dt = datetime(2023, 9, 1)
-    end_dt = datetime(2023, 10, 3)
-    dt = datetime(2023, 9, 1)
+    start_dt = datetime(2025, 9, 1)
+    end_dt = datetime(2025, 10, 3)
     
     async def main():
-        df = await HistoricalDataFetcher.fetch_future_klines(
-            symbols=[symbol],
+        df = await HistoricalDataFetcher.fetch_spot_klines(
+            symbols=symbols,
             start_dt=start_dt,
             end_dt=end_dt,
-            interval=interval,
-            frequency="daily",
-            margin_type=MarginTypes.UM,
+            interval=interval
         )
         print(df)
         
