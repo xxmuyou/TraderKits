@@ -13,7 +13,7 @@ import hashlib
 import pandas as pd
 import numpy as np
 
-from .schemas import KlinesColumns
+from .schemas import KlinesColumns, MetricsColumns
 from ....utils import logger, async_get
 from .constants import BaseUrls, FrequencyTypes, FuturesDataItems, SpotDataItems, MarginTypes, INTERVAL_TO_STR_DICT, FUTURE_UM_KLINE_INTERVALS, SPOT_KLINE_INTERVALS
 
@@ -22,6 +22,9 @@ KLINE_COLUMNS = [
     "open_time", "open", "high", "low", "close", "volume", "close_time", "quote_volume", "count", "taker_buy_volume", "taker_buy_quote_volume", "ignore"
 ]
 
+METRICS_COLUMNS = [
+    "create_time", "symbol", "sum_open_interest", "sum_open_interest_value", "count_toptrader_long_short_ratio", "sum_toptrader_long_short_ratio", "count_long_short_ratio", "sum_taker_long_short_vol_ratio"
+]
 
 
 class HistoricalDataFetcher:
@@ -133,23 +136,146 @@ class HistoricalDataFetcher:
         return _filter_and_localize_timestamps(aggregated, start_dt, end_dt)
         
     @staticmethod
-    def fetch_future_metrics(
+    async def fetch_future_metrics(
         symbols: Iterable[str],
         start_dt: datetime,
         end_dt: datetime,
         interval: timedelta,
+        frequency: Literal["daily", "monthly"] = "daily",
+        *,
+        max_concurrency: int = 16,
+        max_workers: int = 8,
+        timeout: float = 10.0,
     ) -> Mapping[str, pd.DataFrame]:
-        ...
+        """
+        Fetch futures metrics (open interest, long/short ratios, etc.) for multiple
+        symbols over a date range.
+
+        Raw metrics files are sampled at 5-minute resolution. Missing 5-minute slots
+        within each daily file are back-filled with NaN. The cleaned series is then
+        resampled (mean-aggregated) to *interval*.
+
+        Pipeline:
+            1. Build one URL per (symbol, date) combination.
+            2. Fetch all zip + checksum files concurrently via :func:`fetch_urls_async`.
+            3. Verify checksums, decompress, and fill 5-min gaps in a thread pool.
+            4. Aggregate per-symbol DataFrames and resample to *interval*.
+
+        Args:
+            symbols: Trading pairs, e.g. ``["BTCUSDT", "ETHUSDT"]``.
+            start_dt: Inclusive start of the date range.
+            end_dt: Inclusive end of the date range.
+            interval: Resampling interval, e.g. ``timedelta(minutes=5)``, ``timedelta(hours=1)``.
+                      Must be a multiple of 5 minutes.
+            frequency: ``"daily"`` for per-day files or ``"monthly"`` for per-month files.
+            max_concurrency: Maximum concurrent HTTP coroutines.
+            max_workers: Maximum threads in the decompression / cleaning pool.
+            timeout: Per-request HTTP timeout in seconds.
+
+        Returns:
+            ``{symbol: DataFrame}`` with metrics columns resampled to *interval*.
+        """
+        if FrequencyTypes.has_value(frequency):
+            frequency_enum = FrequencyTypes(frequency)
+        else:
+            raise ValueError(f"Invalid frequency: {frequency}. Must be 'daily' or 'monthly'.")
+
+        margin_type_enum = MarginTypes.UM
+        tasks = [
+            (symbol, _build_future_metrics_url(
+                BaseUrls.FUTURE, symbol, date_str, margin_type_enum, frequency_enum
+            ))
+            for symbol in symbols
+            for date_str in iter_dates(start_dt, end_dt, frequency_enum)
+        ]
+
+        # Step 2: Fetch all zip + checksum files concurrently
+        fetched_results = await fetch_urls_async(tasks, max_concurrency=max_concurrency, timeout=timeout)
+        logger.info("Fetched metrics files successfully.")
+
+        # Step 3: Drain fetch queue, then clean each file in a thread pool.
+        # Each thread: verify checksum → unzip → fill 5-min gaps → build List[MetricsColumns].
+        raw_tasks: list[tuple[str, bytes, str]] = []
+        while not fetched_results.empty():
+            raw_tasks.append(fetched_results.get_nowait())
+
+        processed_queue = run_in_thread_pool(
+            _process_metrics_raw_data,
+            raw_tasks,
+            max_workers=max_workers,
+        )
+
+        # Step 4: Aggregate per-symbol DataFrames and resample to requested interval
+        aggregated = _aggregate_symbol_dataframes(processed_queue)
+        return _resample_metrics_to_interval(aggregated, interval, start_dt, end_dt)
+
         
     @staticmethod
-    def fetch_premium_index_klines(
+    async def fetch_premium_index_klines(
         symbols: Iterable[str],
         start_dt: datetime,
         end_dt: datetime,
         interval: timedelta,
-        frequency: Literal["daily", "monthly"]="daily",
+        frequency: Literal["daily", "monthly"] = "daily",
+        *,
+        max_concurrency: int = 16,
+        max_workers: int = 8,
+        timeout: float = 10.0,
     ) -> Mapping[str, pd.DataFrame]:
-        ...
+        """
+        Fetch futures index price klines for multiple symbols over a date range.
+
+        Pipeline:
+            1. Build one URL per (symbol, date) combination.
+            2. Fetch all zip + checksum files concurrently via :func:`fetch_urls_async`.
+            3. Verify checksums and decompress concurrently in a thread pool.
+            4. Concatenate and return per-symbol DataFrames.
+
+        Args:
+            symbols: Trading pairs, e.g. ``["BTCUSDT", "ETHUSDT"]``.
+            start_dt: Inclusive start of the date range.
+            end_dt: Inclusive end of the date range.
+            interval: Kline interval as a timedelta, e.g. ``timedelta(minutes=1)``, ``timedelta(hours=1)``, ``timedelta(days=1)``.
+            frequency: ``"daily"`` for per-day files or ``"monthly"`` for per-month files.
+            max_concurrency: Maximum concurrent HTTP coroutines.
+            max_workers: Maximum threads in the decompression pool.
+            timeout: Per-request HTTP timeout in seconds.
+
+        Returns:
+            ``{symbol: DataFrame}`` with all requested periods concatenated.
+        """
+        interval_str = convert_interval_to_str(interval, FUTURE_UM_KLINE_INTERVALS)
+        if FrequencyTypes.has_value(frequency):
+            frequency_enum = FrequencyTypes(frequency)
+        else:
+            raise ValueError(f"Invalid frequency: {frequency}. Must be 'daily' or 'monthly'.")
+        margin_type_enum = MarginTypes.UM
+        tasks = [
+            (symbol, _build_future_kline_url(
+                BaseUrls.FUTURE, symbol, interval_str, date_str, FuturesDataItems.INDEX_PRICE_KLINES, margin_type_enum, frequency_enum
+            ))
+            for symbol in symbols
+            for date_str in iter_dates(start_dt, end_dt, frequency_enum)
+        ]
+
+        # Step 2: Fetch all zip + checksum files concurrently
+        fetched_results = await fetch_urls_async(tasks, max_concurrency=max_concurrency, timeout=timeout)
+        logger.info("Fetched files successfully.")
+        # Step 3: Drain fetch queue, then process each item in a thread pool.
+        # Each thread: verify checksum -> unzip -> build List[KlinesColumns].
+        raw_tasks: list[tuple[str, bytes, str]] = []
+        while not fetched_results.empty():
+            raw_tasks.append(fetched_results.get_nowait())
+
+        processed_queue = run_in_thread_pool(
+            _process_kline_raw_data,
+            raw_tasks,
+            max_workers=max_workers,
+        )
+
+        # Step 4: Aggregate per-symbol DataFrames (each thread already built one).
+        aggregated = _aggregate_symbol_dataframes(processed_queue)
+        return _filter_and_localize_timestamps(aggregated, start_dt, end_dt)
     
     @staticmethod
     def fetch_index_price_klines(
@@ -498,6 +624,203 @@ async def fetch_urls_async(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Metrics-specific helpers
+# ---------------------------------------------------------------------------
+
+# The raw metrics data uses a fixed 5-minute sampling cadence.
+_METRICS_RAW_INTERVAL = timedelta(minutes=5)
+
+
+def _build_future_metrics_url(
+    base_url: BaseUrls,
+    symbol: str,
+    date_str: str,
+    margin_type: MarginTypes,
+    frequency: FrequencyTypes,
+) -> str:
+    """Construct the Binance Vision zip URL for a single futures metrics file.
+
+    Example:
+        https://data.binance.vision/data/futures/um/daily/metrics/BTCUSDT/BTCUSDT-2025-01-01.zip
+    """
+    return (
+        f"{base_url.value}"
+        f"{margin_type.value}/"
+        f"{frequency.value}/"
+        f"{FuturesDataItems.METRICS.value}/"
+        f"{symbol}/"
+        f"{symbol}-metrics-{date_str}.zip"
+    )
+
+
+def _align_metrics_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure *df* carries the expected :data:`METRICS_COLUMNS` column names.
+
+    Binance metrics CSVs ship with a header row, so this is normally a no-op.
+    The fallback handles the rare case where the file is header-less.
+    """
+    if not any(col in df.columns for col in METRICS_COLUMNS):
+        df = df.copy()
+        df.columns = pd.to_numeric(df.columns, errors="coerce")
+        df = df.T.reset_index().T.reset_index(drop=True)
+        df.columns = METRICS_COLUMNS
+    return df
+
+
+def _fill_5min_intervals(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee a row for every 5-minute slot within the day covered by *df*.
+
+    Missing slots are inserted with NaN for all value columns.  The daily
+    window is inferred from the earliest timestamp present in *df*.
+
+    Args:
+        df: DataFrame whose first column is ``create_time`` (parsed to
+            ``datetime64``).
+
+    Returns:
+        A new DataFrame with ``create_time`` as a regular column and a
+        complete 5-minute timeline.
+    """
+    df = df.copy()
+    df["create_time"] = pd.to_datetime(df["create_time"])
+
+    # Drop the symbol column — it is redundant (the caller already tracks the symbol).
+    df = df.drop(columns=["symbol"], errors="ignore")
+    df = df.set_index("create_time")
+
+    # Build the complete 5-minute grid for the calendar day of the first row.
+    day_start: pd.Timestamp = df.index.min().normalize()
+    day_end: pd.Timestamp = day_start + timedelta(hours=23, minutes=55)
+    full_index = pd.date_range(start=day_start, end=day_end, freq="5min")
+
+    # Reindex — rows for missing timestamps become NaN.
+    df = df.reindex(full_index)
+    df.index.name = "create_time"
+    return df.reset_index()
+
+
+def _to_float(val) -> float:
+    """Safely cast *val* to ``float``, returning ``nan`` for non-numeric or NaT values."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _convert_df_to_metrics_schemas(df: pd.DataFrame) -> List[MetricsColumns]:
+    """Row-wise conversion of a cleaned metrics DataFrame to :class:`MetricsColumns`.
+
+    ``create_time`` is converted to a millisecond Unix timestamp stored as
+    ``float`` so that it is compatible with the NaN-aware ``float64`` arrays
+    used throughout the pipeline.
+    """
+    rows = []
+    for _, row in df.iterrows():
+        ct = row["create_time"]
+        ts = ct.timestamp() * 1000 if pd.notna(ct) else np.nan
+        rows.append(
+            MetricsColumns(
+                timestamp=ts,
+                sum_open_interest=_to_float(row.get("sum_open_interest")),
+                sum_open_interest_value=_to_float(row.get("sum_open_interest_value")),
+                count_toptrader_long_short_ratio=_to_float(row.get("count_toptrader_long_short_ratio")),
+                sum_toptrader_long_short_ratio=_to_float(row.get("sum_toptrader_long_short_ratio")),
+                count_long_short_ratio=_to_float(row.get("count_long_short_ratio")),
+                sum_taker_long_short_vol_ratio=_to_float(row.get("sum_taker_long_short_vol_ratio")),
+            )
+        )
+    return rows
+
+
+def _metrics_to_dataframe(metrics: List[MetricsColumns]) -> pd.DataFrame:
+    """Convert ``List[MetricsColumns]`` to a ``DataFrame`` via numpy arrays.
+
+    Uses the same column-extraction strategy as :func:`_klines_to_dataframe`
+    for consistency and performance.
+    """
+    fields = [f.name for f in dataclasses.fields(MetricsColumns)]
+    if not metrics:
+        return pd.DataFrame(columns=fields)
+    return pd.DataFrame(
+        {
+            col: np.array([getattr(m, col) for m in metrics], dtype=np.float64)
+            for col in fields
+        }
+    )
+
+
+def _process_metrics_raw_data(
+    symbol: str, zip_content: bytes, checksum: str
+) -> Tuple[str, pd.DataFrame] | None:
+    """Verify checksum, decompress, align columns, fill 5-min gaps, and schema-convert.
+
+    Returns ``None`` if the checksum verification or any subsequent step fails
+    (exceptions are propagated via the thread pool and logged by the caller).
+    """
+    if verify_checksum(zip_content, checksum):
+        df = read_zip_file(zip_content, symbol)
+        df = _align_metrics_columns(df)
+        df = _fill_5min_intervals(df)
+        metrics = _convert_df_to_metrics_schemas(df)
+        return (symbol, _metrics_to_dataframe(metrics))
+    return None
+
+
+def _resample_metrics_to_interval(
+    symbol_dfs: dict[str, pd.DataFrame],
+    interval: timedelta,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> dict[str, pd.DataFrame]:
+    """Resample 5-minute metrics DataFrames to the requested *interval*.
+
+    Each interval bucket is aligned to Unix-epoch boundaries (floor division).
+    Value columns are aggregated by mean; the bucket's representative timestamp
+    is the start of the interval window, converted to ``datetime64``.
+
+    Args:
+        symbol_dfs: Per-symbol DataFrames with 5-minute resolution and a
+            millisecond ``timestamp`` column.
+        interval: Target resampling interval.
+        start_dt: Inclusive lower bound used to filter the output.
+        end_dt: Inclusive upper bound used to filter the output.
+
+    Returns:
+        ``{symbol: DataFrame}`` with timestamps converted to ``datetime64``.
+    """
+    interval_ms = int(interval.total_seconds() * 1000)
+    value_cols = [f.name for f in dataclasses.fields(MetricsColumns) if f.name != "timestamp"]
+    # Use pd.Timestamp for start/end so the UTC interpretation matches the data
+    # timestamps produced by pd.Timestamp.timestamp() in _convert_df_to_metrics_schemas.
+    start_ms = pd.Timestamp(start_dt).timestamp() * 1000
+    end_ms = pd.Timestamp(end_dt).timestamp() * 1000
+    result: dict[str, pd.DataFrame] = {}
+
+    for sym, df in symbol_dfs.items():
+        df = df.copy()
+        # Snap each 5-min timestamp down to the nearest interval boundary.
+        df["interval_ts"] = (df["timestamp"] // interval_ms) * interval_ms
+
+        # Aggregate each metric column by mean within each interval window.
+        grouped = (
+            df.groupby("interval_ts")[value_cols]
+            .mean()
+            .reset_index()
+            .rename(columns={"interval_ts": "timestamp"})
+        )
+
+        # Filter to [start_dt, end_dt].
+        mask = (grouped["timestamp"] >= start_ms) & (grouped["timestamp"] <= end_ms)
+        filtered = grouped.loc[mask].copy()
+
+        # Convert millisecond timestamp to human-readable datetime64.
+        filtered["timestamp"] = pd.to_datetime(filtered["timestamp"], unit="ms")
+        result[sym] = filtered.sort_values("timestamp").reset_index(drop=True)
+
+    return result
+
+
 def convert_datetime_to_string(dt: datetime) -> str:
     """
     Convert a :class:`datetime` object to a date string in ``YYYY-MM-DD`` format.
@@ -518,7 +841,7 @@ if __name__ == "__main__":
     end_dt = datetime(2025, 10, 3)
     
     async def main():
-        df = await HistoricalDataFetcher.fetch_spot_klines(
+        df = await HistoricalDataFetcher.fetch_premium_index_klines(
             symbols=symbols,
             start_dt=start_dt,
             end_dt=end_dt,

@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 *.pyo
+*.DS_Store
+.env
+.venv/
 
 # Ignore specific files or directories
 scripts/*
